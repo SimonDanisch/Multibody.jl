@@ -1,17 +1,34 @@
 # Find variables that are both array form and scalarized / collected
 # foreach(println, sort(unknowns(IRSystem(model)), by=string))
 module Multibody
-
+# Find variables that are both array form and scalarized / collected
+# foreach(println, sort(unknowns(IRSystem(model)), by=string))
 using LinearAlgebra
 using ModelingToolkit
 using JuliaSimCompiler
 import ModelingToolkitStandardLibrary.Mechanical.Rotational
 import ModelingToolkitStandardLibrary.Mechanical.TranslationalModelica as Translational
+import ModelingToolkitStandardLibrary.Blocks
+using SparseArrays
 using StaticArrays
 export Rotational, Translational
 
 export render, render!
 export subs_constants
+
+"""
+A helper function that calls `collect` on all parameters in a vector of parameters in a smart way
+"""
+function collect_all(pars)
+    pc = map(pars) do p
+        if p isa AbstractArray || !(p isa SymbolicUtils.BasicSymbolic{<:Real})
+            collect(p)
+        else
+            p
+        end
+    end
+    reduce(vcat, pc)
+end
 
 """
 Find parameters that occur both scalarized and not scalarized
@@ -102,6 +119,7 @@ function find_defaults_with_val(model, c=[0, 1]; defs = defaults(model), ssys = 
 end
 
 """
+    scene       = render(model, prob)
     scene, time = render(model, sol, t::Real; framerate = 30, traces = [])
     path        = render(model, sol, timevec = range(sol.t[1], sol.t[end], step = 1 / framerate); framerate = 30, timescale=1, display=false, loop=1)
 
@@ -109,7 +127,8 @@ Create a 3D animation of a multibody system
 
 # Arguments:
 - `model`: The _unsimplified_ multibody model, i.e., this is the model _before_ any call to `structural_simplify`.
-- `sol`: The `ODESolution` produced by simulating the system using `solve`
+- `prob`: If an `ODEProblem` is passed, a static rendering of the system at the initial condition is generated.
+- `sol`: If an `ODESolution` produced by simulating the system using `solve` is passed, an animation or dynamic rendering of the system is generated.
 - `t`: If a single number `t` is provided, the mechanism at this time is rendered and a scene is returned together with the time as an `Observable`. Modify `time[] = new_time` to change the rendering.
 - `timevec`: If a vector of times is provided, an animation is created and the path to the file on disk is returned.
 - `framerate`: Number of frames per second.
@@ -158,6 +177,26 @@ mesh!(scene, thing; style...)
 A boolean indicating whether or not the component performed any rendering. Typically, all custom methods of this function should return `true`, while the default fallback method is the only one returning false.
 """
 function render! end
+
+"""
+    urdf2multibody(filename::AbstractString; extras=false, out=nothing, worldconnection = :rigid)
+
+Translate a URDF file into a Multibody model. Only available if LightXML.jl, Graphs.jl, MetaGraphs.jl and JuliaFormatter.jl are manually installed and loaded by the user.
+
+Example usage:
+```
+using Multibody, ModelingToolkit, JuliaSimCompiler, LightXML, Graphs, MetaGraphsNext, JuliaFormatter
+urdf2multibody(joinpath(dirname(pathof(Multibody)), "..", "test/doublependulum.urdf"), extras=true, out="/tmp/urdf_import.jl")
+```
+
+## Keyword arguments
+- `extras=false`: If `true`, the generated code will include package imports, a simulation of the model and a rendering of the model.
+- `out=nothing`: If provided, the generated code will be written to this file, otherwise the string will only be returned.
+- `worldconnection=:rigid`: If `:rigid`, the world frame will be connected to the root link with a rigid connection. If a joint constructor is provided, this component will be instantiated and the root link is connected to the world through this, e.g., `worldconnection = FreeMotion`, `()->Prismatic(n=[0, 1, 0])` etc.
+`render_fixed = false`: Whether or not to render "fixed" joints. These joints aren't actually joints (no degrees of freedom), they are translated to FixedTranslation or FixedRotation components.
+"""
+function urdf2multibody end
+export urdf2multibody, URDFRevolute, URDFPrismatic, NullJoint
 
 const t = let
     (@independent_variables t)[1]
@@ -242,17 +281,17 @@ include("frames.jl")
 export PartialTwoFrames
 include("interfaces.jl")
 
-export World, world, Mounting1D, Fixed, FixedTranslation, FixedRotation, Body, BodyShape, BodyCylinder, BodyBox, Rope
+export World, world, Mounting1D, Fixed, Position, Pose, FixedTranslation, FixedRotation, Body, BodyShape, BodyCylinder, BodyBox, Rope
 include("components.jl")
 
 export Revolute, Prismatic, Planar, Spherical, Universal,
 GearConstraint, FreeMotion, RevolutePlanarLoopConstraint, Cylindrical
 include("joints.jl")
 
-export SphericalSpherical, UniversalSpherical, JointUSR, JointRRR
+export SphericalSpherical, UniversalSpherical, JointUSR, JointRRR, PrismaticConstraint
 include("fancy_joints.jl")
 
-export RollingWheelJoint, RollingWheel, RollingWheelSet, RollingWheelSetJoint, RollingConstraintVerticalWheel
+export RollingWheelJoint, RollingWheel, SlipWheelJoint, SlippingWheel, RollingWheelSet, RollingWheelSetJoint, RollingConstraintVerticalWheel
 include("wheels.jl")
 
 export Spring, Damper, SpringDamperParallel, Torque, Force, WorldForce, WorldTorque
@@ -267,5 +306,10 @@ include("robot/robot_components.jl")
 include("robot/FullRobot.jl")
 
 
+export PlanarMechanics
+include("PlanarMechanics/PlanarMechanics.jl")
+
+export SphereVisualizer, CylinderVisualizer, BoxVisualizer
+include("visualizers.jl")
 
 end

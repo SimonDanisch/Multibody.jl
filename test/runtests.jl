@@ -26,6 +26,11 @@ ssys = structural_simplify(model)
 
 @test length(unknowns(ssys)) == 0 # This example is completely rigid and should simplify down to zero state variables
 
+@testset "urdf" begin
+    @info "Testing urdf"
+    include("test_urdf.jl")
+end
+
 @testset "traj" begin
     @info "Testing traj"
     include("test_traj.jl")
@@ -51,6 +56,10 @@ end
     include("test_worldforces.jl")
 end
 
+@testset "PlanarMechanics" begin
+    @info "Testing PlanarMechanics"
+    include("test_PlanarMechanics.jl")
+end
 
 # ==============================================================================
 ## Add spring to make a harmonic oscillator ====================================
@@ -388,7 +397,7 @@ sol = solve(prob, Rodas4())
 doplot() && plot(sol, idxs = joint.s)
 end
 # ==============================================================================
-## Spring damper system from https://www.maplesoft.com/documentation_center/online_manuals/modelica/Modelica_Mechanics_MultiBody_Examples_Elementary.html#Modelica.Mechanics.MultiBody.Examples.Elementary.SpringDamperSystem
+## Spring damper system from Modelica.Mechanics.MultiBody.Examples.Elementary.SpringDamperSystem
 # ==============================================================================
 
 @testset "Spring damper system" begin
@@ -1170,6 +1179,7 @@ prob = ODEProblem(ssys, [
 
 ], (0, 1))
 sol1 = solve(prob, FBDF(), abstol=1e-8, reltol=1e-8)
+@test SciMLBase.successful_retcode(sol1)
 
 ## quat in joint
 @named joint = Multibody.Spherical(isroot=true, state=true, quat=true, neg_w=true)
@@ -1190,6 +1200,7 @@ prob = ODEProblem(ssys, [
 
 ], (0, 1))
 sol2 = solve(prob, FBDF(), abstol=1e-8, reltol=1e-8)
+@test SciMLBase.successful_retcode(sol2)
 
 ## euler
 @named joint = Multibody.Spherical(isroot=true, state=true, quat=false, neg_w=true)
@@ -1254,10 +1265,11 @@ sol = solve(prob, Rodas4())
     @components begin
         world = W()
         ss = UniversalSpherical(rRod_ia = [1, 0, 0], kinematic_constraint=false, sphere_diameter=0.3)
-        ss2 = BodyShape(r = [0, 0, 1], m = 1, isroot=true, neg_w=true)
+        ss2 = BodyShape(r = [0, 0, 1], m = 1, isroot=true)
         s = Spherical()
         trans = FixedTranslation(r = [1,0,1])
-        body2 = Body(; m = 1, isroot = false, r_cm=[0.1, 0, 0], neg_w=true)
+        body2 = Body(; m = 1, r_cm=[0.1, 0, 0])
+        # rp = Multibody.RelativePosition(resolve_frame=:world)
     end
     @equations begin
         connect(world.frame_b, ss.frame_a, trans.frame_a)
@@ -1265,6 +1277,8 @@ sol = solve(prob, Rodas4())
         connect(ss2.frame_b, s.frame_a)
         connect(s.frame_b, trans.frame_b)
         connect(ss.frame_ia, body2.frame_a)
+        # connect(world.frame_b, rp.frame_a)
+        # connect(rp.frame_b, ss2.body.frame_a)
     end
 end
 
@@ -1273,10 +1287,12 @@ model = complete(model)
 ssys = structural_simplify(IRSystem(model))
 prob = ODEProblem(ssys, [
     model.ss2.body.phi[1] => 0.1;
+    model.ss2.body.phi[3] => 0.1;
     model.ss2.body.phid[3] => 0.0;
 ], (0, 1.37))
 sol = solve(prob, Rodas4())
 @test SciMLBase.successful_retcode(sol)
+@test_skip sol[collect(model.rp.r_rel.u)] == sol[collect(model.ss.frame_b.r_0)] # This test is commented out, adding the sensor makes the problem singular and I can't seem to find a set of state priorities that make it solve
 # plot(sol)
 
 ## =============================================================================
@@ -1314,3 +1330,257 @@ sol = solve(prob, Rodas4())
 @test sol[model.cyl.v][end] ≈ -9.81 atol=0.01
 @test sol[model.cyl.phi][end] ≈ 1 atol=0.01
 
+## =============================================================================
+
+@testset "JointUSR_RRR" begin
+    @info "Testing JointUSR_RRR"
+    include("test_JointUSR_RRR.jl")
+end
+
+# ==============================================================================
+## Quarter car suspension
+# ==============================================================================
+@testset "Quarter-car suspension" begin
+    @info "Testing Quarter-car suspension"
+n = [1, 0, 0]
+AB = 146.5 / 1000
+BC = 233.84 / 1000
+CD = 228.60 / 1000
+DA = 221.43 / 1000
+BP = 129.03 / 1000
+DE = 310.31 / 1000
+t5 = 19.84 |> deg2rad
+
+import ModelingToolkitStandardLibrary.Mechanical.TranslationalModelica as Translational
+@mtkmodel QuarterCarSuspension begin
+    @structural_parameters begin
+        spring = true
+        (jc = [0.5, 0.5, 0.5, 0.7])#, [description = "Joint color"]
+    end
+    @parameters begin
+        cs = 4000, [description = "Damping constant [Ns/m]"]
+        ms = 1500, [description = "Body mass [kg]"]
+        ks = 44000, [description = "Spring constant [N/m]"]
+        rod_radius = 0.02
+        amplitude = 0.1, [description = "Amplitude of wheel displacement"]
+        freq = 2, [description = "Frequency of wheel displacement"]
+        jr = 0.03, [description = "Radius of revolute joint"]
+    end
+    @components begin
+        world = W()
+
+        r1 = Revolute(; n, radius=jr, color=jc)
+        r2 = Revolute(; n, radius=jr, color=jc)
+        r3 = Revolute(; n, radius=jr, color=jc)
+        r4 = RevolutePlanarLoopConstraint(; n, radius=jr, color=jc)
+        b1 = FixedTranslation(radius = rod_radius, r = CD*normalize([0, -0.1, 0.3])) # CD
+        b2 = FixedTranslation(radius = rod_radius, r = BC*normalize([0, 0.2, 0])) # BC
+        b3 = FixedTranslation(radius = rod_radius, r = AB*normalize([0, -0.1, 0.2])) # AB
+        chassis = BodyShape(r = DA*normalize([0, 0.2, 0.2*sin(t5)]), m = ms, color=[0.8, 0.8, 0.8, 0.7])
+        
+        if spring
+            springdamper = SpringDamperParallel(c = ks, d = cs, s_unstretched = 1.3*BC, radius=rod_radius) # NOTE: not sure about unstretched length
+        end
+        if spring
+            spring_mount_F = FixedTranslation(r = 0.7*CD*normalize([0, -0.1, 0.3]), render=false) # NOTE: guess 70% of CD
+        end
+        if spring
+            spring_mount_E = FixedTranslation(r = 1.3DA*normalize([0, 0.2, 0.2*sin(t5)]), render=true) # NOTE: guess 130% of DA
+        end
+
+        wheel_prismatic = Prismatic(n = [0,1,0], axisflange=true, state_priority=100, iscut=false)
+        actuation_rod = SphericalSpherical(radius=rod_radius, r_0 = [0, BC, 0])
+        actuation_position = FixedTranslation(r = [0, 0, CD], render=false)
+        wheel_position = Translational.Position(exact=true)
+
+        body_upright = Prismatic(n = [0, 1, 0], render = false)
+    end
+    begin
+        A = chassis.frame_b
+        D = chassis.frame_a
+    end
+    @equations begin
+        wheel_position.s_ref.u ~ amplitude*(sin(2pi*freq*t)) # Displacement of wheel
+        connect(wheel_position.flange, wheel_prismatic.axis)
+
+        connect(world.frame_b, actuation_position.frame_a)
+        connect(actuation_position.frame_b, wheel_prismatic.frame_a)
+        connect(wheel_prismatic.frame_b, actuation_rod.frame_a,)
+        connect(actuation_rod.frame_b, b2.frame_a)
+
+        # Main loop
+        connect(A, r1.frame_a)
+        connect(r1.frame_b, b3.frame_a)
+        connect(b3.frame_b, r4.frame_b)
+        connect(r4.frame_a, b2.frame_b)
+        connect(b2.frame_a, r3.frame_b)
+        connect(r3.frame_a, b1.frame_b)
+        connect(b1.frame_a, r2.frame_b)
+        connect(r2.frame_a, D)
+
+        # Spring damper
+        if spring
+            connect(springdamper.frame_b, spring_mount_E.frame_b)
+            connect(b1.frame_a, spring_mount_F.frame_a)
+            connect(D, spring_mount_E.frame_a)
+            connect(springdamper.frame_a, spring_mount_F.frame_b)
+        end
+
+        # Hold body to world
+        connect(world.frame_b, body_upright.frame_a)
+        connect(body_upright.frame_b, chassis.frame_a)
+    end
+end
+
+@named model = QuarterCarSuspension(spring=true)
+model = complete(model)
+
+defs = [
+    vec(ori(model.chassis.body.frame_a).R .=> I(3))
+    vec(ori(model.chassis.frame_a).R .=> I(3))
+    model.body_upright.s => 0.17
+    model.amplitude => 0.05
+    model.freq => 10
+    model.ks => 30*44000
+    model.cs => 30*4000
+    model.ms => 1500/4
+    model.springdamper.num_windings => 10
+    model.r1.phi => -1.0889
+    model.r2.phi => -0.6031
+    model.r3.phi => 0.47595
+]
+
+ssys = structural_simplify(IRSystem(model))
+display(sort(unknowns(ssys), by=string))
+##
+
+prob = ODEProblem(ssys, defs, (0, 2))
+
+sol = solve(prob, FBDF(autodiff=true); initializealg=ShampineCollocationInit())
+@test SciMLBase.successful_retcode(sol)
+# Multibody.render(model, sol, show_axis=false, x=-1.5, y=0, z=0, timescale=3, display=true) # Video
+# first(Multibody.render(model, sol, 0, show_axis=true, x=-1.5, y=0, z=0))
+
+end
+
+
+@testset "QuarterCar JointRRR" begin
+    @info "Testing QuarterCar JointRRR"
+
+## Quarter car with JointRRR
+n = [1, 0, 0]
+AB = 146.5 / 1000
+BC = 233.84 / 1000
+CD = 228.60 / 1000
+DA = 221.43 / 1000
+BP = 129.03 / 1000
+DE = 310.31 / 1000
+t5 = 19.84 |> deg2rad
+
+import ModelingToolkitStandardLibrary.Mechanical.TranslationalModelica as Translational
+@mtkmodel QuarterCarSuspension begin
+    @structural_parameters begin
+        spring = true
+        (jc = [0.5, 0.5, 0.5, 0.7])#, [description = "Joint color"]
+    end
+    @parameters begin
+        cs = 4000, [description = "Damping constant [Ns/m]"]
+        ms = 1500, [description = "Body mass [kg]"]
+        ks = 44000, [description = "Spring constant [N/m]"]
+        rod_radius = 0.02
+        amplitude = 0.1, [description = "Amplitude of wheel displacement"]
+        freq = 2, [description = "Frequency of wheel displacement"]
+        jr = 0.03, [description = "Radius of revolute joint"]
+    end
+    begin
+        rRod1_ia = AB*normalize([0, -0.1, 0.2])
+        rRod2_ib = BC*normalize([0, 0.2, 0])
+    end
+    @components begin
+        world = W()
+
+        r123 = JointRRR(n_a = n, n_b = n, rRod1_ia, rRod2_ib, rod_radius=0.02, rod_color=jc)
+        r2 = Revolute(; n, radius=jr, color=jc)
+        b1 = FixedTranslation(radius = rod_radius, r = CD*normalize([0, -0.1, 0.3])) # CD
+        chassis = BodyShape(r = DA*normalize([0, 0.2, 0.2*sin(t5)]), m = ms, color=[0.8, 0.8, 0.8, 0.7])
+        
+        if spring
+            springdamper = SpringDamperParallel(c = ks, d = cs, s_unstretched = 1.3*BC, radius=rod_radius) # NOTE: not sure about unstretched length
+        end
+        if spring
+            spring_mount_F = FixedTranslation(r = 0.7*CD*normalize([0, -0.1, 0.3]), render=false) # NOTE: guess 70% of CD
+        end
+        if spring
+            spring_mount_E = FixedTranslation(r = 1.3DA*normalize([0, 0.2, 0.2*sin(t5)]), render=true) # NOTE: guess 130% of DA
+        end
+
+        wheel_prismatic = Prismatic(n = [0,1,0], axisflange=true, state_priority=100, iscut=false)
+        actuation_rod = SphericalSpherical(radius=rod_radius, r_0 = [0, BC, 0])
+        actuation_position = FixedTranslation(r = [0, 0, CD], render=false)
+        wheel_position = Translational.Position(exact=true)
+
+        body_upright = Prismatic(n = [0, 1, 0], render = false)
+    end
+    begin
+        A = chassis.frame_b
+        D = chassis.frame_a
+    end
+    @equations begin
+        wheel_position.s_ref.u ~ amplitude*(sin(2pi*freq*t)) # Displacement of wheel
+        connect(wheel_position.flange, wheel_prismatic.axis)
+
+        connect(world.frame_b, actuation_position.frame_a)
+        connect(actuation_position.frame_b, wheel_prismatic.frame_a)
+        connect(wheel_prismatic.frame_b, actuation_rod.frame_a,)
+        connect(actuation_rod.frame_b, r123.frame_ib)
+
+        # Main loop
+        connect(A, r123.frame_a)
+        connect(r123.frame_b, b1.frame_b)
+        connect(b1.frame_a, r2.frame_b)
+        connect(r2.frame_a, D)
+
+        # Spring damper
+        if spring
+            connect(springdamper.frame_b, spring_mount_E.frame_b)
+            connect(b1.frame_a, spring_mount_F.frame_a)
+            connect(D, spring_mount_E.frame_a)
+            connect(springdamper.frame_a, spring_mount_F.frame_b)
+        end
+
+        # Hold body to world
+        connect(world.frame_b, body_upright.frame_a)
+        connect(body_upright.frame_b, chassis.frame_a)
+    end
+end
+
+@named model = QuarterCarSuspension(spring=true)
+model = complete(model)
+ssys = structural_simplify(IRSystem(model))
+
+defs = [
+    vec(ori(model.chassis.body.frame_a).R .=> I(3))
+    vec(ori(model.chassis.frame_a).R .=> I(3))
+    model.body_upright.s => 0.17
+    model.amplitude => 0.05
+    model.freq => 10
+    model.ks => 30*44000
+    model.cs => 30*4000
+    model.ms => 1500/4
+    model.springdamper.num_windings => 10
+    # model.r1.phi => -1.0889
+    model.r2.phi => -0.6031
+    # model.r3.phi => 0.47595
+    model.body_upright.v => 0.14
+]
+
+display(sort(unknowns(ssys), by=string))
+##
+
+prob = ODEProblem(ssys, defs, (0, 2))
+
+sol = solve(prob, FBDF(autodiff=true); initializealg=ShampineCollocationInit())
+@test SciMLBase.successful_retcode(sol)
+# Multibody.render(model, sol, show_axis=false, x=-1.5, y=0, z=0, timescale=3, display=true) # Video
+# first(Multibody.render(model, sol, 0, show_axis=true, x=-1.5, y=0, z=0))
+end

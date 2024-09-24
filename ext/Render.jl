@@ -2,12 +2,157 @@ module Render
 using Makie
 using Multibody
 import Multibody: render, render!, loop_render, encode, decode, get_rot, get_trans, get_frame
+import Multibody.PlanarMechanics as P
 using Rotations
 using LinearAlgebra
 using ModelingToolkit
 export render, loop_render
 using MeshIO, FileIO
 using StaticArrays
+
+"""
+This struct is used to mimic a solution object such that a model can be rendered without having an actual solution
+"""
+struct FakeSol
+    model
+    prob
+    function FakeSol(model, prob)
+        new(model, prob)
+    end
+end
+
+
+import ModelingToolkit.getu
+
+function recursive_extract(sol, s, depth=0)
+    depth > 10 && error("Recursion depth exceeded with symbol $s")
+    (; model, prob) = sol
+    v = if ModelingToolkit.isparameter(s)
+        prob.ps[s]
+    else
+        prob[s]
+    end
+
+    if ModelingToolkit.Symbolics.is_symbolic_or_array_of_symbolic(v)
+        return recursive_extract(sol, v, depth+1)
+    else
+        return v
+    end
+end
+
+function getu(sol::FakeSol, syms)
+    t->[recursive_extract(sol, s) for s in syms]
+end
+
+function ModelingToolkit.parameter_values(sol::FakeSol)
+    pars = Multibody.collect_all(parameters(sol.model))
+    
+    sol.prob.ps[pars]
+end
+
+function (sol::FakeSol)(t; idxs=nothing)
+    if idxs === nothing
+        sol.prob[unknowns(sol.model)]
+    elseif idxs isa Real
+        recursive_extract(sol, idxs)
+    else
+        # ret = zeros(length(idxs))
+        # Threads.@threads for i in 1:length(idxs)
+        #     ret[i] = recursive_extract(sol, idxs[i])
+        # end
+        # ret
+        [recursive_extract(sol, i) for i in idxs]
+    end
+end
+
+function Base.getproperty(sol::FakeSol, s::Symbol)
+    s ∈ fieldnames(typeof(sol)) && return getfield(sol, s)
+    if s === :t
+        return [0.0]
+    else
+        throw(ArgumentError("$(typeof(sol)) has no property named $s"))
+    end
+end
+
+mutable struct CacheSol
+    model
+    sol
+    cache::Dict{Any, Any}
+    vars
+    last_t::Float64
+    function CacheSol(model, sol)
+        vars = get_all_vars(model) |> unique
+        # Main.vars = vars
+        # @show length(vars)
+        # filter!(v->ModelingToolkit.SymbolicIndexingInterface.is_variable(sol, v), vars) # To work around https://github.com/SciML/ModelingToolkit.jl/issues/3065
+        # @show length(vars)
+        values = sol(0.0, idxs=vars)
+        new(model, sol, Dict(vars .=> values), vars, 0)
+    end
+end
+
+function get_all_vars(model, vars = Multibody.collect_all(unknowns(model)))
+    for sys in model.systems
+        if ModelingToolkit.isframe(sys)
+            newvars = Multibody.ModelingToolkit.renamespace.(model.name, Multibody.Symbolics.unwrap.(vec(ori(sys).R)))
+            append!(vars, newvars)
+        else
+            subsys_ns = getproperty(model, sys.name)
+            get_all_vars(subsys_ns, vars)
+        end
+    end
+    vars
+end
+
+
+get_cached(cs::CacheSol, t::AbstractArray, idxs) = cs.sol(t; idxs)
+function get_cached(cs::CacheSol, t::Real, idxs)
+    if ModelingToolkit.isparameter(idxs[1])
+        return cs.prob.ps[idxs]
+    end
+    if idxs isa AbstractArray{Num}
+        idxs = Multibody.Symbolics.unwrap.(idxs)
+    end
+    if !haskey(cs.cache, idxs[1])
+        # Fallback for things not in cache
+        return cs.sol(t; idxs)
+    end
+    if t != cs.last_t     
+        values = cs.sol(t, idxs=cs.vars)
+        cs.cache = Dict(cs.vars .=> values)
+        cs.last_t = t
+    end
+    if idxs isa Real
+        return cs.cache[idxs]
+    else
+        return [cs.cache[i] for i in idxs]
+    end
+end
+
+
+function getu(cs::CacheSol, syms)
+    t->get_cached(cs::CacheSol, t.t, syms)
+end
+
+function ModelingToolkit.parameter_values(cs::CacheSol)
+    ModelingToolkit.parameter_values(cs.sol)
+    # pars = Multibody.collect_all(parameters(cs.model))
+    # cs.prob.ps[pars]
+end
+
+function (cs::CacheSol)(t; idxs=nothing)
+    if idxs === nothing
+        cs.sol(t)
+    else
+        get_cached(cs, t, idxs)
+    end
+end
+
+function Base.getproperty(cs::CacheSol, s::Symbol)
+    s ∈ fieldnames(typeof(cs)) && return getfield(cs, s)
+    return getproperty(getfield(cs, :sol), s)
+end
+
 
 
 """
@@ -19,7 +164,7 @@ See also [`get_rot`](@ref)
 """
 function get_rot_fun(sol, frame)
     syms = vec(ori(frame).R.mat')
-    getter = ModelingToolkit.getu(sol, syms)
+    getter = getu(sol, syms)
     p = ModelingToolkit.parameter_values(sol)
     function (t)
         iv = sol(t)
@@ -34,7 +179,7 @@ end
 Return a function of `t` that returns `syms` from the solution.
 """
 function get_fun(sol, syms)
-    getter = ModelingToolkit.getu(sol, syms)
+    getter = getu(sol, syms)
     p = ModelingToolkit.parameter_values(sol)
     function (t)
         iv = sol(t)
@@ -132,8 +277,16 @@ function render(model, sol,
     traces = nothing,
     display = false,
     loop = 1,
+    cache = true,
     kwargs...
     )
+    ModelingToolkit.iscomplete(model) || (model = complete(model))
+    if sol isa ODEProblem
+        sol = FakeSol(model, sol)
+        return render(model, sol, 0; x, y, z, lookat, up, show_axis, kwargs...)[1]
+    elseif cache
+        sol = CacheSol(model, sol)
+    end
     scene, fig = default_scene(x,y,z; lookat,up,show_axis)
     if timevec === nothing
         timevec = range(sol.t[1], sol.t[end]*timescale, step=1/framerate)
@@ -146,8 +299,14 @@ function render(model, sol,
     if traces !== nothing
         tvec = range(sol.t[1], stop=sol.t[end], length=500)
         for frame in traces
-            (frame.metadata !== nothing && get(frame.metadata, :frame, false)) || error("Only frames can be traced in animations.")
-            points = get_trans(sol, frame, tvec) |> Matrix
+            (frame.metadata !== nothing) || error("Only frames can be traced in animations.")
+            if get(frame.metadata, :frame, false)
+                points = get_trans(sol, frame, tvec) |> Matrix
+            elseif get(frame.metadata, :frame_2d, false)
+                points = get_trans_2d(sol, frame, tvec) |> Matrix
+            else
+                error("Got fishy frame metadata")
+            end
             Makie.lines!(scene, points)
         end
     end
@@ -156,7 +315,7 @@ function render(model, sol,
     end
     if display
         Base.display(fig)
-        sleep(2)
+        sleep(3)
         fnt = @async begin
             record(fig, filename, timevec; framerate) do time
                 if time == timevec[1]
@@ -181,8 +340,19 @@ function render(model, sol, time::Real;
     x = 2,
     y = 0.5,
     z = 2,
+    cache = true,
     kwargs...,
     )
+
+    ModelingToolkit.iscomplete(model) || (model = complete(model))
+    slider = !(sol isa Union{ODEProblem, FakeSol})
+
+    if sol isa ODEProblem
+        sol = FakeSol(model, sol)
+    end
+    if cache
+        sol = CacheSol(model, sol)
+    end
 
     # fig = Figure()
     # scene = LScene(fig[1, 1]).scene
@@ -192,14 +362,24 @@ function render(model, sol, time::Real;
 
     steps = range(sol.t[1], sol.t[end], length=3000)
 
-    t = Slider(fig[2, 1], range = steps, startvalue = time).value
+    if slider
+        t = Slider(fig[2, 1], range = steps, startvalue = time).value
+    else
+        t = Observable(time)
+    end
     recursive_render!(scene, complete(model), sol, t)
 
     if traces !== nothing
         tvec = range(sol.t[1], stop=sol.t[end], length=500)
         for frame in traces
-            (frame.metadata !== nothing && get(frame.metadata, :frame, false)) || error("Only frames can be traced in animations.")
-            points = get_trans(sol, frame, tvec) |> Matrix
+            (frame.metadata !== nothing) || error("Only frames can be traced in animations.")
+            if get(frame.metadata, :frame, false)
+                points = get_trans(sol, frame, tvec) |> Matrix
+            elseif get(frame.metadata, :frame_2d, false)
+                points = get_trans_2d(sol, frame, tvec) |> Matrix
+            else
+                error("Got fishy frame metadata")
+            end
             Makie.lines!(scene, points)
         end
     end
@@ -239,13 +419,11 @@ end
 render!(scene, ::Any, args...) = false # Fallback for systems that have no rendering
 
 function render!(scene, ::typeof(Body), sys, sol, t)
-    sol(sol.t[1], idxs=sys.render)==true || return true # yes, == true
+    render, radius, length_fraction, cylinder_radius = sol(sol.t[1], idxs=[sys.render, sys.radius, sys.length_fraction, sys.cylinder_radius]) .|> Float32
+    render==true || return true # yes, == true
     color = get_color(sys, sol, :purple)
     r_cm = get_fun(sol, collect(sys.r_cm))
     framefun = get_frame_fun(sol, sys.frame_a)
-    radius = sol(sol.t[1], idxs=sys.radius) |> Float32
-    length_fraction = sol(sol.t[1], idxs=sys.length_fraction) |> Float32
-    cylinder_radius = sol(sol.t[1], idxs=sys.cylinder_radius) |> Float32
     thing = @lift begin # Sphere
         Ta = framefun($t)
         coords = (Ta*[r_cm($t); 1])[1:3] # TODO: make use of a proper transformation library instead of rolling own?
@@ -343,6 +521,7 @@ function render!(scene, ::typeof(Frame), sys, sol, t)
 end
 
 function render!(scene, ::Union{typeof(Revolute), typeof(RevolutePlanarLoopConstraint)}, sys, sol, t)
+    sol(sol.t[1], idxs=sys.render)==true || return true # yes, == true
     r_0 = get_fun(sol, collect(sys.frame_a.r_0))
     n = get_fun(sol, collect(sys.n))
     color = get_color(sys, sol, :red)
@@ -374,6 +553,7 @@ end
 render!(scene, ::typeof(Universal), sys, sol, t) = false # To recurse down to rendering the revolute joints
 
 function render!(scene, ::typeof(Spherical), sys, sol, t)
+    sol(sol.t[1], idxs=sys.render)==true || return true # yes, == true
     vars = get_fun(sol, collect(sys.frame_a.r_0))
     color = get_color(sys, sol, :yellow)
     radius = sol(sol.t[1], idxs=sys.radius)
@@ -390,6 +570,7 @@ render!(scene, ::typeof(FreeMotion), sys, sol, t) = true
 
 
 function render!(scene, ::typeof(FixedTranslation), sys, sol, t)
+    sol(sol.t[1], idxs=sys.render)==true || return true # yes, == true
     r_0a = get_fun(sol, collect(sys.frame_a.r_0))
     r_0b = get_fun(sol, collect(sys.frame_b.r_0))
     color = get_color(sys, sol, :purple)
@@ -401,15 +582,13 @@ function render!(scene, ::typeof(FixedTranslation), sys, sol, t)
         radius = Float32(sol($t, idxs=sys.radius))
         Makie.GeometryBasics.Cylinder(origin, extremity, radius)
     end
-    mesh!(scene, thing; color, specular = Vec3f(1.5), shininess=20f0, diffuse=Vec3f(1))
+    mesh!(scene, thing; color, specular = Vec3f(1.5), shininess=20f0, diffuse=Vec3f(1), transparency=true)
     true
 end
 
 function render!(scene, ::typeof(BodyShape), sys, sol, t)
     color = get_color(sys, sol, :purple)
     shapepath = get_shape(sys, sol)
-    Tshape = reshape(sol(sol.t[1], idxs=sys.shape_transform), 4, 4)
-    scale = Vec3f(Float32(sol(sol.t[1], idxs=sys.shape_scale))*ones(Float32, 3))
     if isempty(shapepath)
         radius = Float32(sol(sol.t[1], idxs=sys.radius))
         r_0a = get_fun(sol, collect(sys.frame_a.r_0))
@@ -421,10 +600,12 @@ function render!(scene, ::typeof(BodyShape), sys, sol, t)
             extremity = r2
             Makie.GeometryBasics.Cylinder(origin, extremity, radius)
         end
-        mesh!(scene, thing; color, specular = Vec3f(1.5))
+        mesh!(scene, thing; color, specular = Vec3f(1.5), shininess=20f0, diffuse=Vec3f(1), transparency=true)
     else
         T = get_frame_fun(sol, sys.frame_a)
-
+        scale = Vec3f(Float32(sol(sol.t[1], idxs=sys.shape_scale))*ones(Float32, 3))
+        Tshape = reshape(sol(sol.t[1], idxs=sys.shape_transform), 4, 4)
+        
         @info "Loading shape mesh $shapepath"
         shapemesh = FileIO.load(shapepath)
         m = mesh!(scene, shapemesh; color, specular = Vec3f(1.5))
@@ -474,9 +655,7 @@ function render!(scene, ::typeof(BodyBox), sys, sol, t)
     
     # NOTE: This draws a solid box without the hole in the middle. Cannot figure out how to render a hollow box
     color = get_color(sys, sol, [1, 0.2, 1, 0.9])
-    width = Float32(sol(sol.t[1], idxs=sys.width))
-    height = Float32(sol(sol.t[1], idxs=sys.height))
-    length = Float32(sol(sol.t[1], idxs=sys.render_length))
+    width, height, length = Float32.(sol(sol.t[1], idxs=[sys.width, sys.height, sys.render_length]))
 
     length_dir = sol(sol.t[1], idxs=collect(sys.render_length_dir))
     width_dir = sol(sol.t[1], idxs=collect(sys.render_width_dir))
@@ -490,10 +669,10 @@ function render!(scene, ::typeof(BodyBox), sys, sol, t)
 
     R0 = [length_dir width_dir height_dir]
     # R0 = Multibody.from_nxy(r, width_dir).R'
-    @assert isapprox(det(R0), 1.0, atol=1e-6)
+    @assert isapprox(det(R0), 1.0, atol=1e-5) "Rotation matrix R0 is not a valid rotation matrix, got `R0 = $R0` with determinant `det(R0) = $(det(R0))`"
     # NOTE: The rotation by this R and the translation with r_shape needs to be double checked
 
-    origin = Vec3f(0, -width/2, -height/2) + r_shape
+    origin = Vec3f(-length/2, -width/2, -height/2) + r_shape
     extent = Vec3f(length, width, height) 
     thing = Makie.Rect3f(origin, extent)
     m = mesh!(scene, thing; color, specular = Vec3f(1.5))
@@ -539,7 +718,7 @@ function render!(scene, ::typeof(UniversalSpherical), sys, sol, t)
     true
 end
 
-function render!(scene, ::typeof(RollingWheelJoint), sys, sol, t)
+function render!(scene, ::Union{typeof(RollingWheelJoint), typeof(SlipWheelJoint)}, sys, sol, t)
     
     r_0 = get_fun(sol, collect(sys.frame_a.r_0))
     # framefun = get_frame_fun(sol, sys.frame_a)
@@ -586,13 +765,13 @@ function render!(scene, ::typeof(Damper), sys, sol, t)
 end
 
 
-function render!(scene, ::typeof(Spring), sys, sol, t)
+function render!(scene, ::Union{typeof(Spring), typeof(SpringDamperParallel)}, sys, sol, t)
     r_0a = get_fun(sol, collect(sys.frame_a.r_0))
     r_0b = get_fun(sol, collect(sys.frame_b.r_0))
     color = get_color(sys, sol, :blue)
     n_wind = sol(sol.t[1], idxs=sys.num_windings)
     radius = sol(sol.t[1], idxs=sys.radius) |> Float32
-    N = sol(sol.t[1], idxs=sys.N) |> Int
+    N = round(Int, sol(sol.t[1], idxs=sys.N))
     thing = @lift begin
         r1 = Point3f(r_0a($t))
         r2 = Point3f(r_0b($t))
@@ -619,6 +798,10 @@ function render!(scene, ::typeof(Multibody.WorldForce), sys, sol, t)
 end
 
 function render!(scene, ::Function, sys, sol, t, args...) # Fallback for systems that have at least two frames
+    try
+        sol(sol.t[1], idxs=sys.render)==true || return true # yes, == true
+    catch
+    end
     frameinds = findall(ModelingToolkit.isframe, collect(sys.systems))
     length(frameinds) == 2 || return false
 
@@ -679,4 +862,268 @@ function rot_from_line(d)
     y = y ./ norm(y)
     RotMatrix{3}([x y d])
 end
+
+Multibody.render!(scene, ::typeof(Multibody.URDFRevolute), sys, sol, t) = false
+Multibody.render!(scene, ::typeof(Multibody.URDFPrismatic), sys, sol, t) = false
+Multibody.render!(scene, ::typeof(Multibody.NullJoint), sys, sol, t) = false
+
+# ==============================================================================
+## PlanarMechanics
+# ==============================================================================
+function get_rot_fun_2d(sol, frame)
+    phifun = get_fun(sol, frame.phi)
+    function (t)
+        phi = phifun(t)
+        [cos(phi) -sin(phi); sin(phi) cos(phi)]
+    end
+end
+
+function get_frame_fun_2d(sol, frame)
+    R = get_rot_fun_2d(sol, frame)
+    tr = get_fun(sol, [frame.x, frame.y])
+    function (t)
+        [R(t) tr(t); 0 0 1]
+    end
+end
+
+get_trans_2d(sol, frame, t) = SVector{2}(sol(t, idxs = [frame.x, frame.y]))
+get_trans_2d(sol, frame, t::AbstractArray) = sol(t, idxs = [frame.x, frame.y])
+
+function render!(scene, ::typeof(P.Body), sys, sol, t)
+    sol(sol.t[1], idxs=sys.render)==true || return true # yes, == true
+    color = get_color(sys, sol, :purple)
+    r_cm = get_fun(sol, collect(sys.r))
+    framefun = get_frame_fun_2d(sol, sys.frame_a)
+    radius = sol(sol.t[1], idxs=sys.radius) |> Float32
+    thing = @lift begin # Sphere
+        # Ta = framefun($t)
+        # coords = (Ta*[0; 0; 1])[1:2]  # r_cm($t)
+
+        coords = r_cm($t)
+        point = Point3f(coords..., 0)
+        Sphere(point, Float32(radius))
+    end
+    mesh!(scene, thing; color, specular = Vec3f(1.5), shininess=20f0, diffuse=Vec3f(1))
+    false
+end
+
+
+function render!(scene, ::Union{typeof(P.FixedTranslation), typeof(P.BodyShape)}, sys, sol, t)
+    sol(sol.t[1], idxs=sys.render)==true || return true # yes, == true
+    r_0a = get_fun(sol, [sys.frame_a.x, sys.frame_a.y])
+    r_0b = get_fun(sol, [sys.frame_b.x, sys.frame_b.y])
+    color = get_color(sys, sol, :purple)
+    thing = @lift begin
+        r1 = Point3f(r_0a($t)..., 0)
+        r2 = Point3f(r_0b($t)..., 0)
+        origin = r1#(r1+r2) ./ 2
+        extremity = r2#-r1 # Double pendulum is a good test for this
+        radius = Float32(sol($t, idxs=sys.radius))
+        Makie.GeometryBasics.Cylinder(origin, extremity, radius)
+    end
+    mesh!(scene, thing; color, specular = Vec3f(1.5), shininess=20f0, diffuse=Vec3f(1))
+    true
+end
+
+function render!(scene, ::typeof(P.Prismatic), sys, sol, t)
+    sol(sol.t[1], idxs=sys.render)==true || return true # yes, == true
+    r_0a = get_fun(sol, [sys.frame_a.x, sys.frame_a.y])
+    r_0b = get_fun(sol, [sys.frame_b.x, sys.frame_b.y])
+    color = get_color(sys, sol, :purple)
+    thing = @lift begin
+        r1 = Point3f(r_0a($t)..., 0)
+        r2 = Point3f(r_0b($t)..., 0)
+        origin = r1#(r1+r2) ./ 2
+        extremity = r2#-r1 # Double pendulum is a good test for this
+        radius = Float32(sol($t, idxs=sys.radius))
+        Makie.GeometryBasics.Cylinder(origin, extremity, radius)
+    end
+    mesh!(scene, thing; color, specular = Vec3f(1.5), shininess=20f0, diffuse=Vec3f(1))
+    true
+end
+
+function render!(scene, ::typeof(P.Revolute), sys, sol, t)
+    sol(sol.t[1], idxs=sys.render)==true || return true # yes, == true
+    r_0 = get_fun(sol, [sys.frame_a.x, sys.frame_a.y])
+    n = [0,0,1]
+    color = get_color(sys, sol, :red)
+
+    rotfun = get_rot_fun_2d(sol, sys.frame_a)
+    radius = try
+        sol(sol.t[1], idxs=sys.radius)
+    catch
+        0.05f0
+    end |> Float32
+    length = try
+        sol(sol.t[1], idxs=sys.length)
+    catch
+        radius
+    end |> Float32
+    thing = @lift begin
+        O = [r_0($t)..., 0]
+        R_w_a = cat(rotfun($t), 1, dims=(1,2))
+        n_w = R_w_a*n # Rotate to the world frame
+        p1 = Point3f(O + length*n_w)
+        p2 = Point3f(O - length*n_w)
+        Makie.GeometryBasics.Cylinder(p1, p2, radius)
+    end
+    mesh!(scene, thing; color, specular = Vec3f(1.5), shininess=20f0, diffuse=Vec3f(1))
+    true
+end
+
+function render!(scene, ::Union{typeof(P.Spring), typeof(P.SpringDamper)}, sys, sol, t)
+    sol(sol.t[1], idxs=sys.render)==true || return true # yes, == true
+    r_0a = get_fun(sol, [sys.frame_a.x, sys.frame_a.y])
+    r_0b = get_fun(sol, [sys.frame_b.x, sys.frame_b.y])
+    color = get_color(sys, sol, :blue)
+    n_wind = sol(sol.t[1], idxs=sys.num_windings)
+    radius = sol(sol.t[1], idxs=sys.radius) |> Float32
+    N = sol(sol.t[1], idxs=sys.N) |> Int
+    thing = @lift begin
+        r1 = Point3f(r_0a($t)..., 0)
+        r2 = Point3f(r_0b($t)..., 0)
+        spring_mesh(r1,r2; n_wind, radius, N)
+    end
+    plot!(scene, thing; color)
+    true
+end
+
+function render!(scene, ::Union{typeof(P.SimpleWheel), typeof(P.SlipBasedWheelJoint)}, sys, sol, t)
+    
+    r_0 = get_fun(sol, [sys.frame_a.x, sys.frame_a.y])
+    rotfun = get_rot_fun_2d(sol, sys.frame_a)
+    color = get_color(sys, sol, :red)
+
+    # TODO: add some form of assumetry to indicate that the wheel is rotating
+
+    radius = try
+        sol(sol.t[1], idxs=sys.radius)
+    catch
+        0.05f0
+    end |> Float32
+    z = try
+        sol(sol.t[1], idxs=sys.z)
+    catch
+        0.0
+    end |> Float32
+    r = try
+        sol(sol.t[1], idxs=collect(sys.r))
+    catch
+        [1, 0]
+    end .|> Float32
+    n_a = perp(normalize(r)) # Rotation axis
+    thing = @lift begin
+        O = [r_0($t)..., z]
+        R_w_a = rotfun($t)
+        n_w = [R_w_a*n_a; 0] # Rotate to the world frame
+        width = radius/10
+        p1 = Point3f(O + width*n_w)
+        p2 = Point3f(O - width*n_w)
+        Makie.GeometryBasics.Cylinder(p1, p2, radius)
+    end
+    mesh!(scene, thing; color, specular = Vec3f(1.5), shininess=20f0, diffuse=Vec3f(1))
+    true
+end
+
+function perp(r)
+    if r[1] == 0
+        return [1, 0]
+    else
+        return [-r[2], r[1]]
+    end
+end
+
+
+# ==============================================================================
+## Visualizers
+# ==============================================================================
+
+function render!(scene, ::typeof(Multibody.BoxVisualizer), sys, sol, t)
+    
+    # NOTE: This draws a solid box without the hole in the middle. Cannot figure out how to render a hollow box
+    color = get_color(sys, sol, [1, 0.2, 1, 0.9])
+    width = Float32(sol(sol.t[1], idxs=sys.width))
+    height = Float32(sol(sol.t[1], idxs=sys.height))
+    length = Float32(sol(sol.t[1], idxs=sys.length))
+
+    length_dir = sol(sol.t[1], idxs=collect(sys.render_length_dir))
+    width_dir = sol(sol.t[1], idxs=collect(sys.render_width_dir))
+    height_dir = normalize(cross(normalize(length_dir), normalize(width_dir)))
+    width_dir = normalize(cross(height_dir, length_dir))
+
+    Rfun = get_rot_fun(sol, sys.frame_a)
+    r_0a = get_fun(sol, collect(sys.frame_a.r_0)) # Origin is translated by r_shape
+    r_shape = sol(sol.t[1], idxs=collect(sys.r_shape))
+    # r = sol(sol.t[1], idxs=collect(sys.r))
+
+    R0 = [length_dir width_dir height_dir]
+    # R0 = Multibody.from_nxy(r, width_dir).R'
+    @assert isapprox(det(R0), 1.0, atol=1e-5) "Rotation matrix R0 is not a valid rotation matrix, got `R0 = $R0` with determinant `det(R0) = $(det(R0))`"
+    # NOTE: The rotation by this R and the translation with r_shape needs to be double checked
+
+    origin = Vec3f(-length/2, -width/2, -height/2) + r_shape
+    extent = Vec3f(length, width, height) 
+    thing = Makie.Rect3f(origin, extent)
+    m = mesh!(scene, thing; color, specular = Vec3f(1.5))
+    on(t) do t
+        r1 = Point3f(r_0a(t))
+        R = Rfun(t)
+        q = Rotations.QuatRotation(R*R0).q
+        Q = Makie.Quaternionf(q.v1, q.v2, q.v3, q.s)
+        Makie.transform!(m, translation=r1, rotation=Q)
+    end
+
+    true
+end
+
+function render!(scene, ::typeof(Multibody.SphereVisualizer), sys, sol, t)
+    sol(sol.t[1], idxs=sys.render)==true || return true # yes, == true
+    color = get_color(sys, sol, :purple)
+    framefun = get_frame_fun(sol, sys.frame_a)
+    radius = sol(sol.t[1], idxs=sys.radius) |> Float32
+    thing = @lift begin # Sphere
+        Ta = framefun($t)
+        coords = Ta[1:3, 4]
+        point = Point3f(coords)
+        Sphere(point, Float32(radius))
+    end
+    mesh!(scene, thing; color, specular = Vec3f(1.5), shininess=20f0, diffuse=Vec3f(1))
+end
+
+function render!(scene, ::typeof(Multibody.CylinderVisualizer), sys, sol, t)
+    color = get_color(sys, sol, :purple)
+    radius = Float32(sol(sol.t[1], idxs=sys.radius))
+    r_0a = get_fun(sol, collect(sys.frame_a.r_0))
+
+
+
+
+    length_dir = sol(sol.t[1], idxs=collect(sys.render_length_dir))
+    width_dir = randn(3,3)
+    height_dir = normalize(cross(normalize(length_dir), normalize(width_dir)))
+    width_dir = normalize(cross(height_dir, length_dir))
+
+    Rfun = get_rot_fun(sol, sys.frame_a)
+
+    R0 = [length_dir width_dir height_dir]
+
+    r1 = Point3f(0,0,0)
+    r2 = Point3f((length*length_direction)...)
+    origin = r1
+    extremity = r2
+    thing = Makie.GeometryBasics.Cylinder(origin, extremity, radius)
+    m = mesh!(scene, thing; color, specular = Vec3f(1.5), shininess=20f0, diffuse=Vec3f(1), transparency=true)
+
+
+    on(t) do t
+        r1 = Point3f(r_0a(t))
+        R = Rfun(t)
+        q = Rotations.QuatRotation(R*R0).q
+        Q = Makie.Quaternionf(q.v1, q.v2, q.v3, q.s)
+        Makie.transform!(m, translation=r1, rotation=Q)
+    end
+
+    true
+end
+
 end
