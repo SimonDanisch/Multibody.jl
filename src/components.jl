@@ -481,16 +481,34 @@ The `BodyShape` component is similar to a [`Body`](@ref), but it has two frames 
 
 See also [`BodyCylinder`](@ref) and [`BodyBox`](@ref) for body components with predefined shapes and automatically computed inertial properties based on geometry and density.
 """
-@component function BodyShape(; name, m = 1, r = [0, 0, 0], r_cm = 0.5*r, r_0 = 0, radius = 0.08, color=purple, shapefile="", shape_transform = I(4), shape_scale = 1, kwargs...)
+@component function BodyShape(; name, m = 1, r = [0, 0, 0], r_cm = 0.5*r, r_0 = 0, radius = 0.08, color=purple, shapefile="", shape_transform = I(4), shape_scale = 1,
+    I_11 = 0.001,
+    I_22 = 0.001,
+    I_33 = 0.001,
+    I_21 = 0,
+    I_31 = 0,
+    I_32 = 0,
+    kwargs...
+    )
+    pars = @parameters begin
+        m = m, [description = "mass"]
+        I_11=I_11, [description = "Element (1,1) of inertia tensor"]
+        I_22=I_22, [description = "Element (2,2) of inertia tensor"]
+        I_33=I_33, [description = "Element (3,3) of inertia tensor"]
+        I_21=I_21, [description = "Element (2,1) of inertia tensor"]
+        I_31=I_31, [description = "Element (3,1) of inertia tensor"]
+        I_32=I_32, [description = "Element (3,2) of inertia tensor"]
+    end
     systems = @named begin
         translation = FixedTranslation(r = r, render=false)
         translation_cm = FixedTranslation(r = r_cm, render=false)
-        body = Body(; m, r_cm, r_0, kwargs...)
+        body = Body(; m, r_cm, r_0, I_11, I_22, I_33, I_21, I_31, I_32, kwargs...)
         frame_a = Frame()
         frame_b = Frame()
         frame_cm = Frame()
     end
 
+    # NOTE: these parameters should be defined before the `systems` block above, but due to bugs in MTK/JSC with higher-order array parameters we cannot do that. We still define the parameters so that they are available to make animations
     @variables r_0(t)[1:3]=r_0 [
         state_priority = 2,
         description = "Position vector from origin of world frame to origin of frame_a",
@@ -504,7 +522,7 @@ See also [`BodyCylinder`](@ref) and [`BodyBox`](@ref) for body components with p
     ]
 
     shapecode = encode(shapefile)
-    @parameters begin
+    more_pars = @parameters begin
         r[1:3]=r, [
             description = "Vector from frame_a to frame_b resolved in frame_a",
         ]
@@ -516,7 +534,7 @@ See also [`BodyCylinder`](@ref) and [`BodyBox`](@ref) for body components with p
     end
 
 
-    pars = [r; radius; color; shapefile; shape_transform; shape_scale]
+    pars = collect_all([pars; more_pars])
 
     r_0, v_0, a_0 = collect.((r_0, v_0, a_0))
 

@@ -884,7 +884,7 @@ function RollingWheelSet(;
     ]
 
     sys = ODESystem(equations, t; name=:nothing, systems)
-    add_params(sys, [width_wheel]; name)
+    add_params(sys, pars; name)
 
 end
 
