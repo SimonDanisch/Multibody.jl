@@ -482,6 +482,7 @@ The `BodyShape` component is similar to a [`Body`](@ref), but it has two frames 
 See also [`BodyCylinder`](@ref) and [`BodyBox`](@ref) for body components with predefined shapes and automatically computed inertial properties based on geometry and density.
 """
 @component function BodyShape(; name, m = 1, r = [0, 0, 0], r_cm = 0.5*r, r_0 = 0, radius = 0.08, color=purple, shapefile="", shape_transform = I(4), shape_scale = 1,
+    height = 0.1_norm(r), width = height, shape = "cylinder",
     I_11 = 0.001,
     I_22 = 0.001,
     I_33 = 0.001,
@@ -508,7 +509,7 @@ See also [`BodyCylinder`](@ref) and [`BodyBox`](@ref) for body components with p
         frame_cm = Frame()
     end
 
-    # NOTE: these parameters should be defined before the `systems` block above, but due to bugs in MTK/JSC with higher-order array parameters we cannot do that. We still define the parameters so that they are available to make animations
+    
     @variables r_0(t)[1:3]=r_0 [
         state_priority = 2,
         description = "Position vector from origin of world frame to origin of frame_a",
@@ -522,6 +523,8 @@ See also [`BodyCylinder`](@ref) and [`BodyBox`](@ref) for body components with p
     ]
 
     shapecode = encode(shapefile)
+    shape = encode(shape)
+    # NOTE: these parameters should be defined before the `systems` block above, but due to bugs in MTK/JSC with higher-order array parameters we cannot do that. We still define the parameters so that they are available to make animations
     more_pars = @parameters begin
         r[1:3]=r, [
             description = "Vector from frame_a to frame_b resolved in frame_a",
@@ -531,10 +534,13 @@ See also [`BodyCylinder`](@ref) and [`BodyBox`](@ref) for body components with p
         shapefile[1:length(shapecode)] = shapecode
         shape_transform[1:16] = vec(shape_transform)
         shape_scale = shape_scale
+        width = width, [description = """Width of the body in animations (if shape = "box")"""]
+        height = height, [description = """Height of the body in animations (if shape = "box")"""]
+        shape[1:length(shape)] = shape
     end
 
-
     pars = collect_all([pars; more_pars])
+
 
     r_0, v_0, a_0 = collect.((r_0, v_0, a_0))
 
