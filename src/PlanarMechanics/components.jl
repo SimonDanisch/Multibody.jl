@@ -126,7 +126,7 @@ The `BodyShape` component is similar to a [`Body`](@ref), but it has two frames 
         I = 0.1, [description = "inertia of the body with respect to the center of mass"]
         radius = 0.1, [description = "Radius of the body in animations"]
         render = true, [description = "Render the body in animations"]
-        (color[1:4] = purple), [description = "Color of the body in animations"]
+        color[1:4] = purple, [description = "Color of the body in animations"]
     end
     @components begin
         translation = FixedTranslation(; r)
@@ -450,7 +450,7 @@ Simple wheel model with viscous lateral friction and a driving torque
     end
     @parameters begin
         (radius = 0.3), [description = "Radius of the wheel"]
-        (color[1:4] = [1, 0, 0, 1]), [description = "Color of the wheel in animations"]
+        color[1:4] = [1, 0, 0, 1], [description = "Color of the wheel in animations"]
         μ = 1e9, [description = "Viscous friction coefficient"]
         # Fy0 = 1e4, [description = "Lateral friction force at zero longitudinal force"]
         # μx = Fy0, [description = "Maximum longitudinal friction force"]
